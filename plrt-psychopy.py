@@ -45,6 +45,13 @@ flip that made the event visible):
     SESSION_END | SESSION_ABORT
 Every visible change of the display is thus bracketed by an ON/OFF pair.
 
+The same markers are published on a Lab Streaming Layer outlet (name 'PLRT',
+type 'Markers', irregular rate, two string channels):
+    channel 0 'text'  the exact string above, as it appears in the EDF
+    channel 1 'json'  {"event":"STIM_ON","block":4,"trial":2,...}
+LabRecorder records it alongside EEG / taVNS streams; the CSV column `t_lsl`
+holds the LSL timestamp of each marker, which is what links the three records.
+
 Outputs (folder ``data/`` next to this script):
     <participant>_<session>_<date>_plrt.csv   event log from PsychoPy clocks
     <EDFNAME>.EDF                              pulled from the Host PC at the end
@@ -54,6 +61,7 @@ console (see project notes on Spyder).
 """
 
 import csv
+import json
 import os
 import random
 import re
@@ -100,6 +108,12 @@ PARAMS = dict(
     abort_key='escape',
     confirm_keys=['space'],        # keyboard keys that confirm a screen ...
     use_cedrus=True,               # ... plus ANY button on a Cedrus response box (pyxid2)
+    # --- Lab Streaming Layer (marker outlet) ---------------------------
+    use_lsl=True,
+    lsl_name='PLRT',               # stream name seen by LabRecorder
+    lsl_type='Markers',
+    lsl_wait_for_consumer=True,    # hold the start until a recorder subscribes
+    lsl_wait_skip_key='s',         # ... or until this key is pressed
 )
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -131,10 +145,11 @@ class DummyTracker(object):
 class EyeLinkSession(object):
     """Thin wrapper around pylink for this task."""
 
-    def __init__(self, ip, edf_name, win, params, log):
+    def __init__(self, ip, edf_name, win, params, log, lsl=None):
         self.win = win
         self.params = params
         self.log = log
+        self.lsl = lsl
         self.edf_name = edf_name
         self.recording = False
         self.dummy = (ip == '' or ip is None)
@@ -235,10 +250,16 @@ class EyeLinkSession(object):
         self.recording = False
 
     def message(self, text):
-        """Send a MSG to the EDF; also mirrors it to the CSV log."""
+        """Send one marker everywhere: EDF (MSG), LSL outlet, CSV log.
+
+        The LSL timestamp is taken first so it describes the moment of the
+        event rather than the time the tracker call happened to return."""
+        ts = pylsl.local_clock() if (HAVE_PYLSL and self.lsl
+                                     and self.lsl.active) else None
         if HAVE_PYLINK:
             self.tracker.sendMessage(text)
-        self.log.edf_message(text)
+        ts = self.lsl.push(text, ts) if self.lsl is not None else ''
+        self.log.edf_message(text, ts)
 
     def close(self, receive_to):
         if not HAVE_PYLINK:
@@ -257,6 +278,123 @@ class EyeLinkSession(object):
             self.tracker.close()
             if self.genv is not None:
                 pylink.closeGraphics()
+
+
+# --------------------------------------------------------------------------
+# Lab Streaming Layer marker outlet (pylsl - bundled with PsychoPy Standalone)
+# --------------------------------------------------------------------------
+try:
+    import pylsl
+    HAVE_PYLSL = True
+except ImportError:
+    pylsl = None
+    HAVE_PYLSL = False
+
+
+# Argument names for each marker, used to build the JSON channel.  Extra
+# arguments beyond this list are collected into "args".
+MARKER_FIELDS = {
+    'SESSION_START': ['participant', 'session'],
+    'SESSION_END': [],
+    'SESSION_ABORT': [],
+    'BLOCK_START': ['block'],
+    'BLOCK_END': ['block'],
+    'PAUSE_ON': ['block'],
+    'PAUSE_OFF': ['block'],
+    'CROSS_ON': ['block', 'phase'],
+    'CROSS_OFF': ['block', 'phase'],
+    'TRIALID': ['block', 'trial'],
+    'STIM_ON': ['block', 'trial', 'stim', 'size'],
+    'STIM_OFF': ['block', 'trial', 'stim'],
+}
+
+
+def marker_to_dict(text):
+    """'STIM_ON 4 2 circle_1_4 0.2500' -> dict, for the JSON channel."""
+    parts = text.split()
+    out = {'event': parts[0] if parts else ''}
+    names = MARKER_FIELDS.get(out['event'], [])
+    values = parts[1:]
+    for i, value in enumerate(values):
+        key = names[i] if i < len(names) else 'arg%d' % (i + 1)
+        try:                       # keep numbers numeric in the JSON
+            out[key] = int(value)
+        except ValueError:
+            try:
+                out[key] = float(value)
+            except ValueError:
+                out[key] = value
+    return out
+
+
+class MarkerStream(object):
+    """Two-channel string marker outlet: ['<plain text>', '<json>'].
+
+    Channel 0 carries exactly the same string that goes into the EDF, so the
+    two records can be matched line by line; channel 1 carries the parsed
+    version for automated processing."""
+
+    def __init__(self, params, info):
+        self.outlet = None
+        if not params['use_lsl']:
+            return
+        if not HAVE_PYLSL:
+            print('WARNING: pylsl not available -> no LSL markers.')
+            return
+        source_id = 'PLRT_%s_%s' % (info['participant'], info['session'])
+        try:
+            sinfo = pylsl.StreamInfo(
+                name=params['lsl_name'], type=params['lsl_type'],
+                channel_count=2, nominal_srate=pylsl.IRREGULAR_RATE,
+                channel_format='string', source_id=source_id)
+            desc = sinfo.desc()
+            desc.append_child_value('task', 'PLRT')
+            desc.append_child_value('participant', str(info['participant']))
+            desc.append_child_value('session', str(info['session']))
+            desc.append_child_value('edf_file', info['edf_name'])
+            channels = desc.append_child('channels')
+            for label in ('text', 'json'):
+                ch = channels.append_child('channel')
+                ch.append_child_value('label', label)
+                ch.append_child_value('type', 'Marker')
+                ch.append_child_value('format', 'string')
+            self.outlet = pylsl.StreamOutlet(sinfo)
+            print("LSL: outlet '%s' (type '%s', source_id '%s') open."
+                  % (params['lsl_name'], params['lsl_type'], source_id))
+        except Exception as err:
+            print('WARNING: could not open the LSL outlet (%s) -> no LSL markers.'
+                  % err)
+            self.outlet = None
+
+    @property
+    def active(self):
+        return self.outlet is not None
+
+    def has_consumer(self):
+        if self.outlet is None:
+            return False
+        try:
+            return bool(self.outlet.have_consumers())
+        except Exception:
+            return False
+
+    def push(self, text, timestamp=None):
+        """Send one marker; returns the LSL timestamp used (or '')."""
+        if self.outlet is None:
+            return ''
+        if timestamp is None:
+            timestamp = pylsl.local_clock()
+        try:
+            self.outlet.push_sample(
+                [text, json.dumps(marker_to_dict(text), separators=(',', ':'))],
+                timestamp)
+        except Exception as err:
+            print('LSL push failed (%s): %s' % (err, text))
+            return ''
+        return timestamp
+
+    def close(self):
+        self.outlet = None          # StreamOutlet is freed with the object
 
 
 # --------------------------------------------------------------------------
@@ -337,8 +475,8 @@ class ResponseBox(object):
 # --------------------------------------------------------------------------
 class EventLog(object):
     FIELDS = ['participant', 'session', 'block', 'trial', 'event', 'stimulus',
-              'size_frac', 't_session', 't_abs', 'planned_s', 'actual_s',
-              'edf_message']
+              'size_frac', 't_session', 't_abs', 't_lsl', 'planned_s',
+              'actual_s', 'edf_message']
 
     def __init__(self, path, participant, session, clock):
         self.participant = participant
@@ -348,9 +486,12 @@ class EventLog(object):
         self.writer = csv.DictWriter(self.fh, fieldnames=self.FIELDS)
         self.writer.writeheader()
         self.pending_msg = ''
+        self.pending_lsl = ''
 
-    def edf_message(self, text):
+    def edf_message(self, text, lsl_timestamp=''):
+        """Remember the marker so the next CSV row can carry it."""
         self.pending_msg = text
+        self.pending_lsl = lsl_timestamp
 
     def write(self, event_name, block='', trial='', stimulus='', size_frac='',
               planned=None, actual=None, t=None):
@@ -360,11 +501,13 @@ class EventLog(object):
             size_frac='' if size_frac in ('', None) else '%.4f' % size_frac,
             t_session='%.4f' % (self.clock.getTime() if t is None else t),
             t_abs='%.4f' % core.getTime(),
+            t_lsl='' if self.pending_lsl == '' else '%.6f' % self.pending_lsl,
             planned_s='' if planned is None else '%.3f' % planned,
             actual_s='' if actual is None else '%.4f' % actual,
             edf_message=self.pending_msg,
         )
         self.pending_msg = ''
+        self.pending_lsl = ''
         self.writer.writerow(row)
         self.fh.flush()
 
@@ -448,8 +591,10 @@ class PLRTask(object):
                             self.session_clock)
         self.box = ResponseBox(enabled=params['use_cedrus'])
         step('response box checked')
+        self.lsl = MarkerStream(params, info)
+        step('LSL outlet ready')
         self.el = EyeLinkSession(info['tracker_ip'], info['edf_name'], self.win,
-                                 params, self.log)
+                                 params, self.log, lsl=self.lsl)
         step('tracker ready')
         print('Startup total: %.2f s' % (core.getTime() - t_start))
 
@@ -519,6 +664,39 @@ class PLRTask(object):
         self.log.write('instructions_confirmed', stimulus=how)
         self.flip()
 
+    def wait_for_recorder(self):
+        """Hold the session until something subscribes to the LSL outlet.
+
+        Esc aborts, the skip key continues without a recorder."""
+        p = self.p
+        if not (p['use_lsl'] and p['lsl_wait_for_consumer'] and self.lsl.active):
+            return
+        if self.lsl.has_consumer():
+            print('LSL: recorder already connected.')
+            return
+        print('LSL: waiting for a recorder to subscribe '
+              '(press %s to continue without one).' % p['lsl_wait_skip_key'])
+        self.text.text = ('Čekám na připojení LSL recorderu...\n\n'
+                          'Spusťte LabRecorder a zaškrtněte stream "%s".\n\n'
+                          '(%s = pokračovat bez záznamu, Esc = konec)'
+                          % (p['lsl_name'], p['lsl_wait_skip_key']))
+        event.clearEvents()
+        while not self.lsl.has_consumer():
+            self.text.draw()
+            self.win.flip()
+            keys = event.getKeys(keyList=[p['lsl_wait_skip_key'],
+                                          p['abort_key']])
+            if p['abort_key'] in keys:
+                raise AbortExperiment()
+            if keys:
+                print('LSL: continuing without a recorder.')
+                self.log.write('lsl_wait_skipped')
+                self.flip()
+                return
+        print('LSL: recorder connected.')
+        self.log.write('lsl_consumer_connected')
+        self.flip()
+
     def end_screen(self):
         self.text.text = 'Konec měření. Děkujeme.'
         self.flip(self.text)
@@ -529,11 +707,15 @@ class PLRTask(object):
     # ------------------------------------------------------------------
     def run(self):
         p, el, log = self.p, self.el, self.log
-        t0 = core.getTime()
-        el.calibrate()
-        print('  [%6.2f s] calibration finished' % (core.getTime() - t0))
+        # Calibration is done externally (Host PC / separate procedure) and is
+        # deliberately not driven from this script.  To bring it back, uncomment
+        # the three lines below.
+        # t0 = core.getTime()
+        # el.calibrate()
+        # print('  [%6.2f s] calibration finished' % (core.getTime() - t0))
         self.win.mouseVisible = False
         self.flip()
+        self.wait_for_recorder()
         self.instructions()
 
         el.start_recording()
@@ -620,6 +802,7 @@ class PLRTask(object):
             self.el.close(receive_to=DATA_DIR)
         except Exception as err:      # never lose the CSV because of the tracker
             print('Tracker shutdown error:', err)
+        self.lsl.close()
         self.log.close()
         self.win.close()
 
