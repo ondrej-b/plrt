@@ -5,17 +5,28 @@ plrt-psychopy.py -- Pupillary Light Reflex Task (PLRT)
 ======================================================
 taVNS project, September 2026
 
-PsychoPy (coder-style) implementation of the PLR task with direct EyeLink
-integration through SR Research's ``pylink``.  Runs without a tracker in
-"dummy mode" (leave the tracker address empty in the start dialog) and even
-without ``pylink`` installed (a no-op stub is used, with a warning).
+PsychoPy (coder-style) implementation of the PLR task.
+
+How it fits the lab setup (PARAMS: use_eyelink=False, the default)
+------------------------------------------------------------------
+The EyeLink is not driven from here.  Its Host PC streams over SR Research's
+own protocol to a separate Ubuntu machine, which republishes the eye data as
+an LSL stream; LabRecorder stores that stream together with the marker stream
+this script publishes, so everything ends up in one XDF with timestamps in a
+common clock domain.  Calibration is likewise handled externally.  This script
+therefore only presents the stimuli, publishes markers over LSL and writes its
+own CSV event log.
+
+Setting use_eyelink=True switches on the built-in pylink path instead: the
+script then connects to a Host PC, opens an EDF, sends the same markers as MSG
+records, starts/stops recording and pulls the EDF at the end.
 
 Design (all durations configurable in PARAMS below)
 ---------------------------------------------------
 Session:
-    dialog -> connect tracker, open EDF -> camera setup / calibration (once)
-    -> instructions -> start recording (continuous for the whole session)
-    -> 4 blocks -> stop recording, receive EDF, close.
+    dialog -> open LSL outlet (-> optional tracker connection)
+    -> wait for a recorder to subscribe -> instructions
+    -> 4 blocks -> close.
 
 Block (repeated N_BLOCKS times, stimulus order fixed 1 -> 4):
     PAUSE       black screen, no cross                 120 s
@@ -33,8 +44,8 @@ Stimulus durations are frame-counted (12 frames at 60 Hz); the long
 intervals are clock-based but keep flipping every frame so that the
 keyboard (Esc = abort) stays responsive.
 
-EDF messages (timestamped by the Host PC on receipt, sent right after the
-flip that made the event visible):
+Markers (sent right after the flip that made the event visible; they go to the
+LSL outlet always, and additionally into the EDF when use_eyelink=True):
     SESSION_START <participant> <session>
     BLOCK_START <k>            BLOCK_END <k>
     PAUSE_ON <k>               PAUSE_OFF <k>
@@ -47,14 +58,14 @@ Every visible change of the display is thus bracketed by an ON/OFF pair.
 
 The same markers are published on a Lab Streaming Layer outlet (name 'PLRT',
 type 'Markers', irregular rate, two string channels):
-    channel 0 'text'  the exact string above, as it appears in the EDF
+    channel 0 'text'  the exact string above
     channel 1 'json'  {"event":"STIM_ON","block":4,"trial":2,...}
-LabRecorder records it alongside EEG / taVNS streams; the CSV column `t_lsl`
-holds the LSL timestamp of each marker, which is what links the three records.
+LabRecorder records it alongside the eye / EEG / taVNS streams; the CSV column
+`t_lsl` holds the LSL timestamp of each marker, which links the records.
 
 Outputs (folder ``data/`` next to this script):
     <participant>_<session>_<date>_plrt.csv   event log from PsychoPy clocks
-    <EDFNAME>.EDF                              pulled from the Host PC at the end
+    <EDFNAME>.EDF                              only when use_eyelink=True
 
 Run from a real terminal or the PsychoPy Runner, not from an inline IPython
 console (see project notes on Spyder).
@@ -97,7 +108,15 @@ PARAMS = dict(
     fullscreen=True,
     expected_hz=60.0,              # used if measurement is off or unreliable
     measure_refresh=True,          # False -> trust expected_hz, skip the ~2 s test
-    tracker_ip='100.1.1.1',        # default in the dialog; '' -> dummy mode
+    # --- EyeLink ------------------------------------------------------
+    # In this lab the tracker is NOT driven from here: the Host PC streams to a
+    # separate Ubuntu machine which republishes the eye data as its own LSL
+    # stream, and LabRecorder stores that together with the markers below.  So
+    # pylink stays switched off and the IP field is hidden from the dialog.
+    # Set use_eyelink=True to connect to a Host PC directly (opens an EDF,
+    # sends the same markers as MSG, starts/stops recording, pulls the EDF).
+    use_eyelink=False,
+    tracker_ip='100.1.1.1',        # only used when use_eyelink=True; '' -> dummy
     dummy_use_pylink=False,        # dummy mode: True exercises pylink's own dummy
                                    # connection (slow) incl. the calibration screen;
                                    # False bypasses pylink entirely (instant start)
@@ -154,6 +173,14 @@ class EyeLinkSession(object):
         self.recording = False
         self.dummy = (ip == '' or ip is None)
         self.genv = None
+        self.uses_pylink = False       # True only once a real pylink object exists
+
+        if not params['use_eyelink']:
+            print('EyeLink: not driven from this script (eye data reach the '
+                  'recording via the lab LSL stream).')
+            self.tracker = DummyTracker()
+            self.dummy = True
+            return
 
         if not HAVE_PYLINK:
             print('WARNING: pylink not available -> tracker calls are no-ops.')
@@ -177,6 +204,7 @@ class EyeLinkSession(object):
         else:
             print('EyeLink: connecting to %s ...' % ip)
             self.tracker = pylink.EyeLink(ip)
+        self.uses_pylink = True
 
         # --- open EDF on the Host PC ------------------------------------
         self.tracker.openDataFile(edf_name)
@@ -223,7 +251,7 @@ class EyeLinkSession(object):
     # ------------------------------------------------------------------
     def calibrate(self):
         """Camera setup + calibration screen (press Enter/Esc to leave)."""
-        if not HAVE_PYLINK or self.genv is None:
+        if not self.uses_pylink or self.genv is None:
             return
         try:
             self.tracker.doTrackerSetup()
@@ -232,7 +260,7 @@ class EyeLinkSession(object):
             self.tracker.exitCalibration()
 
     def start_recording(self):
-        if not HAVE_PYLINK:
+        if not self.uses_pylink:
             return
         self.tracker.setOfflineMode()
         # record samples + events to file and over the link
@@ -243,26 +271,22 @@ class EyeLinkSession(object):
         self.recording = True
 
     def stop_recording(self):
-        if not HAVE_PYLINK or not self.recording:
+        if not self.uses_pylink or not self.recording:
             return
         pylink.pumpDelay(100)
         self.tracker.stopRecording()
         self.recording = False
 
-    def message(self, text):
-        """Send one marker everywhere: EDF (MSG), LSL outlet, CSV log.
+    def send(self, text):
+        """Write one MSG into the EDF. No-op unless a real tracker is in use.
 
-        The LSL timestamp is taken first so it describes the moment of the
-        event rather than the time the tracker call happened to return."""
-        ts = pylsl.local_clock() if (HAVE_PYLSL and self.lsl
-                                     and self.lsl.active) else None
-        if HAVE_PYLINK:
+        Deliberately does NOT touch LSL or the log: the marker has already gone
+        out by the time this is called (see PLRTask.mark and run_block)."""
+        if self.uses_pylink:
             self.tracker.sendMessage(text)
-        ts = self.lsl.push(text, ts) if self.lsl is not None else ''
-        self.log.edf_message(text, ts)
 
     def close(self, receive_to):
-        if not HAVE_PYLINK:
+        if not self.uses_pylink:
             return
         try:
             if self.recording:
@@ -370,6 +394,31 @@ class MarkerStream(object):
     def active(self):
         return self.outlet is not None
 
+    # --- split push, for use around a flip ----------------------------
+    # prepare() does the expensive part (string formatting, JSON encoding)
+    # BEFORE the flip; push_at() is then a single library call, so the gap
+    # between the physical frame onset and the marker is a few microseconds.
+    def prepare(self, text):
+        """Build the 2-channel sample ahead of time; None if the outlet is off."""
+        if self.outlet is None:
+            return None
+        return [text, json.dumps(marker_to_dict(text), separators=(',', ':'))]
+
+    def now(self):
+        """Current LSL time, or '' when the outlet is off."""
+        return pylsl.local_clock() if self.outlet is not None else ''
+
+    def push_at(self, sample, timestamp):
+        """Send a sample built by prepare(). Keep this call as short as possible."""
+        if self.outlet is None or sample is None:
+            return ''
+        try:
+            self.outlet.push_sample(sample, timestamp)
+        except Exception as err:
+            print('LSL push failed (%s): %s' % (err, sample[0]))
+            return ''
+        return timestamp
+
     def has_consumer(self):
         if self.outlet is None:
             return False
@@ -377,21 +426,6 @@ class MarkerStream(object):
             return bool(self.outlet.have_consumers())
         except Exception:
             return False
-
-    def push(self, text, timestamp=None):
-        """Send one marker; returns the LSL timestamp used (or '')."""
-        if self.outlet is None:
-            return ''
-        if timestamp is None:
-            timestamp = pylsl.local_clock()
-        try:
-            self.outlet.push_sample(
-                [text, json.dumps(marker_to_dict(text), separators=(',', ':'))],
-                timestamp)
-        except Exception as err:
-            print('LSL push failed (%s): %s' % (err, text))
-            return ''
-        return timestamp
 
     def close(self):
         self.outlet = None          # StreamOutlet is freed with the object
@@ -485,8 +519,10 @@ class EventLog(object):
         self.fh = open(path, 'w', newline='')
         self.writer = csv.DictWriter(self.fh, fieldnames=self.FIELDS)
         self.writer.writeheader()
+        self.fh.flush()
         self.pending_msg = ''
         self.pending_lsl = ''
+        self.buffer = []           # rows wait here; disk I/O never near a flip
 
     def edf_message(self, text, lsl_timestamp=''):
         """Remember the marker so the next CSV row can carry it."""
@@ -508,10 +544,19 @@ class EventLog(object):
         )
         self.pending_msg = ''
         self.pending_lsl = ''
-        self.writer.writerow(row)
+        self.buffer.append(row)
+
+    def flush(self):
+        """Write buffered rows out. Call only during quiet periods."""
+        if not self.buffer:
+            return
+        for row in self.buffer:
+            self.writer.writerow(row)
+        self.buffer = []
         self.fh.flush()
 
     def close(self):
+        self.flush()
         self.fh.close()
 
 
@@ -612,10 +657,26 @@ class PLRTask(object):
         self.win.flip()
         return self.session_clock.getTime()
 
+    def mark(self, text, event_name, ts=None, **logkw):
+        """Emit a marker that is NOT tied to a frame onset.
+
+        Order is still LSL first, bookkeeping after, but the timing of these
+        markers (block/pause boundaries) is not critical - the display change
+        they describe is a slow one."""
+        sample = self.lsl.prepare(text)
+        if ts is None:
+            ts = self.lsl.now()
+        self.lsl.push_at(sample, ts)
+        self.el.send(text)
+        self.log.edf_message(text, ts)
+        self.log.write(event_name, **logkw)
+        return ts
+
     def hold(self, duration, *stims):
         """Keep `stims` on screen for `duration` seconds (frame loop, abortable).
         Returns the actual duration (time until the loop was left)."""
         t0 = self.session_clock.getTime()
+        self.log.flush()           # disk I/O here, never around a stimulus flip
         # keep flipping so that keys are polled and timing stays frame-locked;
         # stop when the *next* flip would fall after the deadline
         while self.session_clock.getTime() + self.frame_s / 2.0 < t0 + duration:
@@ -720,43 +781,39 @@ class PLRTask(object):
 
         el.start_recording()
         self.session_clock.reset()
-        el.message('SESSION_START %s %s' % (self.info['participant'], self.info['session']))
-        log.write('session_start')
+        self.mark('SESSION_START %s %s'
+                  % (self.info['participant'], self.info['session']),
+                  'session_start')
         log.write('info_refresh_hz', actual=self.hz)
         log.write('info_seed', stimulus=str(self.info['seed']))
 
         try:
             for b in range(1, p['n_blocks'] + 1):
                 self.run_block(b)
-            el.message('SESSION_END')
-            log.write('session_end')
+            self.mark('SESSION_END', 'session_end')
             self.end_screen()
         except AbortExperiment:
-            el.message('SESSION_ABORT')
-            log.write('session_abort')
+            self.mark('SESSION_ABORT', 'session_abort')
             print('Aborted by experimenter (%s).' % p['abort_key'])
         finally:
             self.shutdown()
 
     def run_block(self, b):
-        p, el, log = self.p, self.el, self.log
-        el.message('BLOCK_START %d' % b)
-        log.write('block_start', block=b)
+        p, el, log, lsl = self.p, self.el, self.log, self.lsl
+        self.mark('BLOCK_START %d' % b, 'block_start', block=b)
 
         # ---- pause: black screen -----------------------------------
         planned = self.scaled(p['pause_s'])
         self.flip()
-        el.message('PAUSE_ON %d' % b)
-        log.write('pause_on', block=b, planned=planned)
+        self.mark('PAUSE_ON %d' % b, 'pause_on', block=b, planned=planned)
         actual = self.hold(planned)
 
         # ---- baseline: cross only ----------------------------------
         planned_bl = self.scaled(self.uniform(p['baseline_range_s']))
         self.flip(self.cross)
-        el.message('PAUSE_OFF %d' % b)
-        log.write('pause_off', block=b, actual=actual)
-        el.message('CROSS_ON %d baseline' % b)
-        log.write('cross_on', block=b, stimulus='baseline', planned=planned_bl)
+        ts = self.mark('PAUSE_OFF %d' % b, 'pause_off', block=b, actual=actual)
+        self.mark('CROSS_ON %d baseline' % b, 'cross_on', ts=ts, block=b,
+                  stimulus='baseline', planned=planned_bl)
         actual = self.hold(planned_bl, self.cross)
 
         # ---- four stimuli, each followed by an ISI with the cross ----
@@ -765,37 +822,69 @@ class PLRTask(object):
             phase_before = 'baseline' if t == 1 else 'isi'
             size_frac = 1.0 if frac is None else frac
 
-            el.message('TRIALID %d %d' % (b, t))
-            log.write('trialid', block=b, trial=t, stimulus=name, size_frac=size_frac)
-            # stimulus onset (first frame)
-            t_on = self.flip(stim)
-            el.message('CROSS_OFF %d %s' % (b, phase_before))
-            log.write('cross_off', block=b, stimulus=phase_before, actual=actual, t=t_on)
-            el.message('STIM_ON %d %d %s %.4f' % (b, t, name, size_frac))
-            log.write('stim_on', block=b, trial=t, stimulus=name, size_frac=size_frac,
-                      planned=p['stim_s'], t=t_on)
+            self.mark('TRIALID %d %d' % (b, t), 'trialid', block=b, trial=t,
+                      stimulus=name, size_frac=size_frac)
+
+            # ---------- STIMULUS ONSET ----------
+            # Everything that can be computed in advance is computed here, so
+            # that the flip -> timestamp -> push sequence below contains no
+            # string formatting, no JSON, no disk and no tracker call.
+            msg_on = 'STIM_ON %d %d %s %.4f' % (b, t, name, size_frac)
+            msg_cross_off = 'CROSS_OFF %d %s' % (b, phase_before)
+            smp_on = lsl.prepare(msg_on)
+            smp_cross_off = lsl.prepare(msg_cross_off)
+            planned_isi = self.scaled(self.uniform(p['isi_range_s']))
+            msg_off = 'STIM_OFF %d %d %s' % (b, t, name)
+            msg_cross_on = 'CROSS_ON %d isi' % b
+            smp_off = lsl.prepare(msg_off)
+            smp_cross_on = lsl.prepare(msg_cross_on)
+            stim.draw()
+
+            self.win.flip()                       # <- physical onset
+            ts_on = lsl.now()                     # <- ~1 us later
+            lsl.push_at(smp_on, ts_on)            # <- the critical marker
+
+            # --- non-critical bookkeeping, all stamped with ts_on ---
+            t_on = self.session_clock.getTime()
+            lsl.push_at(smp_cross_off, ts_on)
+            el.send(msg_cross_off)
+            el.send(msg_on)
+            log.edf_message(msg_cross_off, ts_on)
+            log.write('cross_off', block=b, stimulus=phase_before, actual=actual,
+                      t=t_on)
+            log.edf_message(msg_on, ts_on)
+            log.write('stim_on', block=b, trial=t, stimulus=name,
+                      size_frac=size_frac, planned=p['stim_s'], t=t_on)
+
             # remaining frames of the stimulus
             for _ in range(self.stim_frames - 1):
                 stim.draw()
                 self.win.flip()
-            # stimulus offset = cross back on
-            planned_isi = self.scaled(self.uniform(p['isi_range_s']))
-            t_off = self.flip(self.cross)
-            el.message('STIM_OFF %d %d %s' % (b, t, name))
-            log.write('stim_off', block=b, trial=t, stimulus=name, size_frac=size_frac,
-                      actual=t_off - t_on, t=t_off)
-            el.message('CROSS_ON %d isi' % b)
-            log.write('cross_on', block=b, trial=t, stimulus='isi', planned=planned_isi,
-                      t=t_off)
+
+            # ---------- STIMULUS OFFSET (cross back on) ----------
+            self.cross.draw()
+            self.win.flip()                       # <- physical offset
+            ts_off = lsl.now()
+            lsl.push_at(smp_off, ts_off)          # <- the critical marker
+
+            t_off = self.session_clock.getTime()
+            lsl.push_at(smp_cross_on, ts_off)
+            el.send(msg_off)
+            el.send(msg_cross_on)
+            log.edf_message(msg_off, ts_off)
+            log.write('stim_off', block=b, trial=t, stimulus=name,
+                      size_frac=size_frac, actual=t_off - t_on, t=t_off)
+            log.edf_message(msg_cross_on, ts_off)
+            log.write('cross_on', block=b, trial=t, stimulus='isi',
+                      planned=planned_isi, t=t_off)
+
             actual = self.hold(planned_isi, self.cross)
 
         # ---- block end: cross off (next pause or end screen follows) ---
         self.flip()
-        el.message('CROSS_OFF %d isi' % b)
-        log.write('cross_off', block=b, trial=len(p['stimuli']), stimulus='isi',
-                  actual=actual)
-        el.message('BLOCK_END %d' % b)
-        log.write('block_end', block=b)
+        ts = self.mark('CROSS_OFF %d isi' % b, 'cross_off', block=b,
+                       trial=len(p['stimuli']), stimulus='isi', actual=actual)
+        self.mark('BLOCK_END %d' % b, 'block_end', ts=ts, block=b)
 
     def shutdown(self):
         try:
@@ -824,18 +913,20 @@ def main():
     info = {
         'participant': 'P00',
         'session': '1',
-        'tracker_ip': PARAMS['tracker_ip'],
         'fullscreen': PARAMS['fullscreen'],
     }
-    dlg = gui.DlgFromDict(
-        info, title='PLRT',
-        order=['participant', 'session', 'tracker_ip', 'fullscreen'],
-        tip={'tracker_ip': 'Prázdné = dummy mode (bez trackeru)'})
+    order = ['participant', 'session', 'fullscreen']
+    tips = {}
+    if PARAMS['use_eyelink']:          # only ask for the IP if we talk to a tracker
+        info['tracker_ip'] = PARAMS['tracker_ip']
+        order.insert(2, 'tracker_ip')
+        tips['tracker_ip'] = 'IP adresa EyeLink Host PC; prázdné = bez trackeru'
+    dlg = gui.DlgFromDict(info, title='PLRT', order=order, tip=tips)
     if not dlg.OK:
         core.quit()
 
     PARAMS['fullscreen'] = bool(info['fullscreen'])
-    info['tracker_ip'] = info['tracker_ip'].strip()
+    info['tracker_ip'] = str(info.get('tracker_ip', '')).strip()
     info['seed'] = PARAMS['seed'] if PARAMS['seed'] is not None else int(time.time())
 
     os.makedirs(DATA_DIR, exist_ok=True)
