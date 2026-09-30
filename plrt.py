@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-plrt-psychopy.py -- Pupillary Light Reflex Task (PLRT)
+plrt.py -- Pupillary Light Reflex Task (PLRT)
 ======================================================
 taVNS project, September 2026
 
@@ -80,7 +80,7 @@ import sys
 import time
 from datetime import datetime
 
-from psychopy import core, event, gui, visual
+from psychopy import core, event, gui, monitors, visual
 
 # --------------------------------------------------------------------------
 # Parameters
@@ -106,6 +106,11 @@ PARAMS = dict(
     cross_line_px=3,
     screen=0,                      # monitor index for the stimulus window
     fullscreen=True,
+    # Shared lab monitor definition, registered once per machine by
+    # setup_monitor.py (see the tavns-cpt repository); the SART task uses the
+    # same one.  Missing here is a warning, not an error: stimulus sizes are
+    # in 'height' units and do not depend on it.
+    monitor_name='taVNS_lab',
     expected_hz=60.0,              # used if measurement is off or unreliable
     measure_refresh=True,          # False -> trust expected_hz, skip the ~2 s test
     # --- EyeLink ------------------------------------------------------
@@ -376,6 +381,7 @@ class MarkerStream(object):
             desc.append_child_value('participant', str(info['participant']))
             desc.append_child_value('session', str(info['session']))
             desc.append_child_value('edf_file', info['edf_name'])
+            desc.append_child_value('monitor', info.get('monitor_desc', 'undefined'))
             channels = desc.append_child('channels')
             for label in ('text', 'json'):
                 ch = channels.append_child('channel')
@@ -583,8 +589,16 @@ class PLRTask(object):
             step.last = now
         step.last = t_start
 
+        # --- monitor ----------------------------------------------------
+        self.mon, self.monitor_desc = self.load_monitor(params['monitor_name'])
+        if self.mon is not None:
+            info['monitor_name'] = params['monitor_name']
+            info['monitor_desc'] = self.monitor_desc
+        step('monitor resolved')
+
         # --- window ----------------------------------------------------
         self.win = visual.Window(
+            monitor=self.mon,
             fullscr=params['fullscreen'], screen=params['screen'],
             color=params['bg_color'], colorSpace='rgb', units='height',
             allowGUI=False, waitBlanking=True)
@@ -646,6 +660,53 @@ class PLRTask(object):
     # ------------------------------------------------------------------
     # helpers
     # ------------------------------------------------------------------
+    @staticmethod
+    def load_monitor(name):
+        """Fetch the shared lab monitor definition.
+
+        Returns (Monitor or None, description string).  A missing or incomplete
+        definition only warns: sizes here are fractions of the window height, so
+        the task itself does not need the geometry - but then nothing about the
+        screen is recorded with the data."""
+        advice = ("Spusťte setup_monitor.py (repozitář tavns-cpt) nebo monitor "
+                  "nadefinujte v PsychoPy Monitor Center.")
+        try:
+            known = monitors.getAllMonitors()
+        except Exception as err:
+            print('WARNING: monitor list unavailable (%s).' % err)
+            return None, 'unavailable'
+        if name not in known:
+            # Say WHERE we looked and WHAT is there: a monitor defined in the
+            # Monitor Center of a different Windows account, an elevated shell
+            # or another PsychoPy install lands in a different prefs folder and
+            # is simply invisible here.
+            folder = getattr(monitors, 'monitorFolder', None)
+            if folder is None:
+                try:
+                    from psychopy import prefs
+                    folder = os.path.join(prefs.paths['userPrefsDir'], 'monitors')
+                except Exception:
+                    folder = '<neznámá složka>'
+            print("WARNING: monitor '%s' není na tomto počítači nadefinovaný -> "
+                  "PsychoPy použije výchozí hodnoty a do dat se nezapíše "
+                  "geometrie obrazovky. %s" % (name, advice))
+            print("         hledáno v: %s" % folder)
+            print("         nalezené monitory: %s"
+                  % (', '.join(known) if known else '(žádné)'))
+            return None, 'undefined'
+        mon = monitors.Monitor(name)
+        width, dist, size = mon.getWidth(), mon.getDistance(), mon.getSizePix()
+        if width is None or dist is None:
+            print("WARNING: monitor '%s' nemá vyplněnou šířku nebo vzdálenost -> "
+                  "geometrie se nezapíše. %s" % (name, advice))
+            return None, 'incomplete'
+        desc = '%s %.1fcm %.1fcm %sx%s' % (name, width, dist,
+                                           size[0] if size else '?',
+                                           size[1] if size else '?')
+        print("Monitor '%s': šířka %.1f cm, vzdálenost %.1f cm, %s px."
+              % (name, width, dist, size))
+        return mon, desc
+
     def check_abort(self):
         if event.getKeys(keyList=[self.p['abort_key']]):
             raise AbortExperiment()
@@ -785,6 +846,7 @@ class PLRTask(object):
                   % (self.info['participant'], self.info['session']),
                   'session_start')
         log.write('info_refresh_hz', actual=self.hz)
+        log.write('info_monitor', stimulus=self.monitor_desc)
         log.write('info_seed', stimulus=str(self.info['seed']))
 
         try:
@@ -910,23 +972,30 @@ def make_edf_name(participant, session):
 
 
 def main():
-    info = {
-        'participant': 'P00',
-        'session': '1',
+    # The dict keys are what the dialog shows as field labels, so they are
+    # spelled the way the experimenter should read them; they are copied onto
+    # the internal names right after the dialog closes.
+    fields = {
+        'participant_id': 'P00',
+        'session_id': 'S00',
         'fullscreen': PARAMS['fullscreen'],
     }
-    order = ['participant', 'session', 'fullscreen']
+    order = ['participant_id', 'session_id', 'fullscreen']
     tips = {}
     if PARAMS['use_eyelink']:          # only ask for the IP if we talk to a tracker
-        info['tracker_ip'] = PARAMS['tracker_ip']
+        fields['tracker_ip'] = PARAMS['tracker_ip']
         order.insert(2, 'tracker_ip')
         tips['tracker_ip'] = 'IP adresa EyeLink Host PC; prázdné = bez trackeru'
-    dlg = gui.DlgFromDict(info, title='PLRT', order=order, tip=tips)
+    dlg = gui.DlgFromDict(fields, title='PLRT', order=order, tip=tips)
     if not dlg.OK:
         core.quit()
 
-    PARAMS['fullscreen'] = bool(info['fullscreen'])
-    info['tracker_ip'] = str(info.get('tracker_ip', '')).strip()
+    info = {
+        'participant': str(fields['participant_id']).strip() or 'P00',
+        'session': str(fields['session_id']).strip() or 'S00',
+    }
+    PARAMS['fullscreen'] = bool(fields['fullscreen'])
+    info['tracker_ip'] = str(fields.get('tracker_ip', '')).strip()
     info['seed'] = PARAMS['seed'] if PARAMS['seed'] is not None else int(time.time())
 
     os.makedirs(DATA_DIR, exist_ok=True)
