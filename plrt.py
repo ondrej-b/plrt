@@ -26,19 +26,20 @@ Design (all durations configurable in PARAMS below)
 Session:
     dialog -> open LSL outlet (-> optional tracker connection)
     -> wait for a recorder to subscribe -> instructions
-    -> 4 blocks -> close.
+    -> DARK ADAPTATION, black screen, 90 s
+    -> 4 blocks, running straight on from one another
+    -> close.
 
-Block (repeated N_BLOCKS times, stimulus order fixed 1 -> 4):
-    PAUSE       black screen, no cross                 120 s
-    BASELINE    black screen + grey fixation cross     U(20, 30) s
-    STIM 1      white disc, diameter 1/8 screen height 200 ms   (cross off)
-    ISI         black screen + grey fixation cross     U(15, 22) s
-    STIM 2      white disc, diameter 1/4 screen height 200 ms
-    ISI                                                U(15, 22) s
-    STIM 3      white disc, diameter 1/2 screen height 200 ms
-    ISI                                                U(15, 22) s
-    STIM 4      full white screen                      200 ms
-    ISI                                                U(15, 22) s
+Trial (4 per block, stimulus order fixed 1 -> 4, 4 blocks):
+    GET-READY   black screen + grey fixation cross     3 s
+    STIMULUS    white disc or full white screen        200 ms   (cross off)
+    ANALYSIS    black screen + grey fixation cross     15 s
+    ISI         black screen, no cross                 U(5, 7) s
+
+    stimulus 1  white disc, diameter 1/8 screen height
+    stimulus 2  white disc, diameter 1/4 screen height
+    stimulus 3  white disc, diameter 1/2 screen height
+    stimulus 4  full white screen
 
 Stimulus durations are frame-counted (12 frames at 60 Hz); the long
 intervals are clock-based but keep flipping every frame so that the
@@ -47,14 +48,18 @@ keyboard (Esc = abort) stays responsive.
 Markers (sent right after the flip that made the event visible; they go to the
 LSL outlet always, and additionally into the EDF when use_eyelink=True):
     SESSION_START <participant> <session>
+    ADAPT_ON                   ADAPT_OFF
     BLOCK_START <k>            BLOCK_END <k>
-    PAUSE_ON <k>               PAUSE_OFF <k>
-    CROSS_ON <k> <phase>       CROSS_OFF <k> <phase>      phase = baseline|isi
     TRIALID <k> <t>            (t = 1..4 within block)
+    READY_ON <k> <t>           READY_OFF <k> <t>
     STIM_ON <k> <t> <name> <size_frac>
     STIM_OFF <k> <t> <name>
+    ANALYSIS_ON <k> <t>        ANALYSIS_OFF <k> <t>
+    ISI_ON <k> <t>             ISI_OFF <k> <t>
     SESSION_END | SESSION_ABORT
-Every visible change of the display is thus bracketed by an ON/OFF pair.
+Every visible change of the display is thus bracketed by an ON/OFF pair; the
+OFF of one screen and the ON of the next carry the same timestamp, because
+they describe one and the same flip.
 
 The same markers are published on a Lab Streaming Layer outlet (name 'PLRT',
 type 'Markers', irregular rate, two string channels):
@@ -87,10 +92,11 @@ from psychopy import core, event, gui, monitors, visual
 # --------------------------------------------------------------------------
 PARAMS = dict(
     n_blocks=4,
-    pause_s=120.0,                 # black screen before every block (incl. block 1) 120
-    baseline_range_s=(20.0, 30.0), # cross only, start of block
+    adapt_s=90.0,                  # dark adaptation, black screen, once per session
+    ready_s=3.0,                   # get-ready cross before every stimulus
     stim_s=0.200,                  # each stimulus
-    isi_range_s=(15.0, 22.0),      # cross only, after every stimulus
+    analysis_s=15.0,               # cross after the stimulus (pupil response)
+    isi_range_s=(5.0, 7.0),        # black screen, no cross, end of every trial
     # stimuli in presentation order: (name, diameter as fraction of screen height;
     # None = full white screen)
     stimuli=[
@@ -128,7 +134,8 @@ PARAMS = dict(
     sample_rate=500,
     calibration_type='HV5',
     seed=None,                     # None -> random seed derived from time (logged)
-    debug_speed=20.0,               # >1 shortens pause/baseline/ISI for testing (stim unchanged)
+    debug_speed=1.0,               # >1 shortens adaptation/ready/analysis/ISI for
+                                   # testing; the 200 ms stimuli stay untouched
     abort_key='escape',
     confirm_keys=['space'],        # keyboard keys that confirm a screen ...
     use_cedrus=True,               # ... plus ANY button on a Cedrus response box (pyxid2)
@@ -139,6 +146,30 @@ PARAMS = dict(
     lsl_wait_for_consumer=True,    # hold the start until a recorder subscribes
     lsl_wait_skip_key='s',         # ... or until this key is pressed
 )
+
+# --------------------------------------------------------------------------
+# Instructions: one screen per item, each advanced by any confirm key or any
+# Cedrus button.  '{minutes}' is filled in from the durations in PARAMS.
+# --------------------------------------------------------------------------
+INSTRUCTION_PAGES = [
+    'Měření pupilární reakce na světlo\n\n'
+    'Během měření budeme snímat velikost vaší zornice.\n'
+    'Vaším úkolem je pouze sedět v klidu a dívat se na obrazovku;\n'
+    'nic nemusíte mačkat ani nijak odpovídat.\n\n'
+    'Pokračujte stisknutím tlačítka.',
+
+    'Když je na obrazovce křížek, snažte se hledět přímo na něj\n'
+    'a nemrkat.\n\n'
+    'Když je obrazovka prázdná, můžete dát očím odpočinout.\n\n'
+    'Pokračujte stisknutím tlačítka.',
+
+    'Občas se objeví krátký záblesk. Snažte se v tu chvíli nemrkat\n'
+    'a dál se dívat do středu obrazovky.\n\n'
+    'Na začátku bude obrazovka delší dobu úplně černá -\n'
+    'zůstaňte prosím v klidu a dívejte se před sebe.\n\n'
+    'Celé měření trvá přibližně {minutes} minut.\n\n'
+    'Stisknutím tlačítka měření začne.',
+]
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(SCRIPT_DIR, 'data')
@@ -326,15 +357,19 @@ MARKER_FIELDS = {
     'SESSION_START': ['participant', 'session'],
     'SESSION_END': [],
     'SESSION_ABORT': [],
+    'ADAPT_ON': [],
+    'ADAPT_OFF': [],
     'BLOCK_START': ['block'],
     'BLOCK_END': ['block'],
-    'PAUSE_ON': ['block'],
-    'PAUSE_OFF': ['block'],
-    'CROSS_ON': ['block', 'phase'],
-    'CROSS_OFF': ['block', 'phase'],
     'TRIALID': ['block', 'trial'],
+    'READY_ON': ['block', 'trial'],
+    'READY_OFF': ['block', 'trial'],
     'STIM_ON': ['block', 'trial', 'stim', 'size'],
     'STIM_OFF': ['block', 'trial', 'stim'],
+    'ANALYSIS_ON': ['block', 'trial'],
+    'ANALYSIS_OFF': ['block', 'trial'],
+    'ISI_ON': ['block', 'trial'],
+    'ISI_OFF': ['block', 'trial'],
 }
 
 
@@ -580,6 +615,8 @@ class PLRTask(object):
         self.info = info
         self.rng = random.Random(info['seed'])
         self.session_clock = core.Clock()
+        self._pending_off = None       # OFF marker owed by the screen on display
+        self.last_actual = None        # measured duration of the phase just ended
         t_start = core.getTime()
 
         def step(label):
@@ -603,6 +640,12 @@ class PLRTask(object):
             color=params['bg_color'], colorSpace='rgb', units='height',
             allowGUI=False, waitBlanking=True)
         self.win.mouseVisible = False
+        # What the window ENDED UP with.  PsychoPy logs "Monitor specification
+        # not found. Creating a temporary one..." whenever anything builds a
+        # nameless monitor, which can come from elsewhere in the same run, so
+        # this line (and the CSV row below) is the authoritative record.
+        self.window_monitor_desc = self.describe_window_monitor()
+        print('Window monitor: %s' % self.window_monitor_desc)
         step('window opened')
 
         # --- refresh rate & frame counts -------------------------------
@@ -660,6 +703,22 @@ class PLRTask(object):
     # ------------------------------------------------------------------
     # helpers
     # ------------------------------------------------------------------
+    def describe_window_monitor(self):
+        """Name and geometry of the monitor the open window is really using."""
+        mon = getattr(self.win, 'monitor', None)
+        if mon is None:
+            return 'none'
+        try:
+            name = mon.name
+            width, dist, size = mon.getWidth(), mon.getDistance(), mon.getSizePix()
+        except Exception as err:
+            return 'unreadable (%s)' % err
+        if width is None or dist is None:
+            return '%s (bez geometrie)' % name
+        return '%s %.1fcm %.1fcm %sx%s' % (name, width, dist,
+                                           size[0] if size else '?',
+                                           size[1] if size else '?')
+
     @staticmethod
     def load_monitor(name):
         """Fetch the shared lab monitor definition.
@@ -745,7 +804,8 @@ class PLRTask(object):
             for s in stims:
                 s.draw()
             self.win.flip()
-        return self.session_clock.getTime() - t0
+        self.last_actual = self.session_clock.getTime() - t0
+        return self.last_actual
 
     def wait_confirm(self, *stims):
         """Show `stims` until a confirm key (space) or ANY Cedrus button is
@@ -771,19 +831,53 @@ class PLRTask(object):
     def uniform(self, rng):
         return self.rng.uniform(*rng)
 
+    # --- screen changes -----------------------------------------------
+    # Each screen "arms" the OFF marker that will be sent when the next screen
+    # replaces it, so every phase is bracketed by an ON/OFF pair and the two
+    # markers around one flip share a timestamp.
+    def arm_off(self, text, event_name, **logkw):
+        self._pending_off = (text, event_name, logkw)
+
+    def fire_off(self, ts, actual=None):
+        if self._pending_off is None:
+            return
+        text, event_name, logkw = self._pending_off
+        self._pending_off = None
+        if actual is not None:
+            logkw = dict(logkw, actual=actual)
+        self.mark(text, event_name, ts=ts, **logkw)
+
+    def show(self, stims, on_text, on_event, actual=None, **logkw):
+        """Non-critical screen change: flip, close the previous phase, open
+        the new one.  Both markers get the timestamp of this flip."""
+        for s in stims:
+            s.draw()
+        self.win.flip()
+        ts = self.lsl.now()
+        self.fire_off(ts, actual=actual)
+        self.mark(on_text, on_event, ts=ts, **logkw)
+        return ts
+
     # ------------------------------------------------------------------
     # screens
     # ------------------------------------------------------------------
+    def estimated_minutes(self):
+        """Rough session length from the current parameters, for the text."""
+        p = self.p
+        per_trial = (p['ready_s'] + p['stim_s'] + p['analysis_s']
+                     + sum(p['isi_range_s']) / 2.0)
+        total = self.scaled(p['adapt_s'] + p['n_blocks'] * len(p['stimuli'])
+                            * per_trial)
+        return max(1, int(round(total / 60.0)))
+
     def instructions(self):
-        self.text.text = (
-            'Během celého měření se prosím dívejte na šedý křížek\n'
-            'uprostřed obrazovky. Občas se objeví krátký záblesk;\n'
-            'snažte se v tu chvíli nemrkat a dál se dívejte do středu.\n\n'
-            'Mezi bloky bude obrazovka na dvě minuty úplně černá -\n'
-            'zůstaňte prosím v klidu a dívejte se před sebe.\n\n'
-            'Pokračujte stisknutím tlačítka.')
-        how = self.wait_confirm(self.text)
-        self.log.write('instructions_confirmed', stimulus=how)
+        """Three text screens, each advanced by a key or a Cedrus button."""
+        pages = [page.format(minutes=self.estimated_minutes())
+                 for page in INSTRUCTION_PAGES]
+        for i, page in enumerate(pages, start=1):
+            self.text.text = page
+            how = self.wait_confirm(self.text)
+            self.log.write('instructions_page', trial=i, stimulus=how)
         self.flip()
 
     def wait_for_recorder(self):
@@ -847,12 +941,17 @@ class PLRTask(object):
                   'session_start')
         log.write('info_refresh_hz', actual=self.hz)
         log.write('info_monitor', stimulus=self.monitor_desc)
+        log.write('info_window_monitor', stimulus=self.window_monitor_desc)
         log.write('info_seed', stimulus=str(self.info['seed']))
 
         try:
+            self.dark_adaptation()
             for b in range(1, p['n_blocks'] + 1):
                 self.run_block(b)
-            self.mark('SESSION_END', 'session_end')
+            # close whatever screen is still up (the last ISI)
+            ts = self.lsl.now()
+            self.fire_off(ts, actual=self.last_actual)
+            self.mark('SESSION_END', 'session_end', ts=ts)
             self.end_screen()
         except AbortExperiment:
             self.mark('SESSION_ABORT', 'session_abort')
@@ -860,46 +959,46 @@ class PLRTask(object):
         finally:
             self.shutdown()
 
+    def dark_adaptation(self):
+        """Black screen at the start of the session, once."""
+        planned = self.scaled(self.p['adapt_s'])
+        self.show((), 'ADAPT_ON', 'adapt_on', planned=planned)
+        self.arm_off('ADAPT_OFF', 'adapt_off')
+        self.hold(planned)                        # black: nothing to draw
+
     def run_block(self, b):
         p, el, log, lsl = self.p, self.el, self.log, self.lsl
         self.mark('BLOCK_START %d' % b, 'block_start', block=b)
 
-        # ---- pause: black screen -----------------------------------
-        planned = self.scaled(p['pause_s'])
-        self.flip()
-        self.mark('PAUSE_ON %d' % b, 'pause_on', block=b, planned=planned)
-        actual = self.hold(planned)
-
-        # ---- baseline: cross only ----------------------------------
-        planned_bl = self.scaled(self.uniform(p['baseline_range_s']))
-        self.flip(self.cross)
-        ts = self.mark('PAUSE_OFF %d' % b, 'pause_off', block=b, actual=actual)
-        self.mark('CROSS_ON %d baseline' % b, 'cross_on', ts=ts, block=b,
-                  stimulus='baseline', planned=planned_bl)
-        actual = self.hold(planned_bl, self.cross)
-
-        # ---- four stimuli, each followed by an ISI with the cross ----
         for t, (name, frac) in enumerate(p['stimuli'], start=1):
             stim = self.discs[name]
-            phase_before = 'baseline' if t == 1 else 'isi'
             size_frac = 1.0 if frac is None else frac
 
             self.mark('TRIALID %d %d' % (b, t), 'trialid', block=b, trial=t,
                       stimulus=name, size_frac=size_frac)
+
+            # ---------- GET-READY: cross ----------
+            planned_ready = self.scaled(p['ready_s'])
+            self.show((self.cross,), 'READY_ON %d %d' % (b, t), 'ready_on',
+                      actual=self.last_actual, block=b, trial=t,
+                      planned=planned_ready)
+            self.arm_off('READY_OFF %d %d' % (b, t), 'ready_off',
+                         block=b, trial=t)
+            self.hold(planned_ready, self.cross)   # cross stays up for the whole phase
 
             # ---------- STIMULUS ONSET ----------
             # Everything that can be computed in advance is computed here, so
             # that the flip -> timestamp -> push sequence below contains no
             # string formatting, no JSON, no disk and no tracker call.
             msg_on = 'STIM_ON %d %d %s %.4f' % (b, t, name, size_frac)
-            msg_cross_off = 'CROSS_OFF %d %s' % (b, phase_before)
+            msg_ready_off = 'READY_OFF %d %d' % (b, t)
             smp_on = lsl.prepare(msg_on)
-            smp_cross_off = lsl.prepare(msg_cross_off)
-            planned_isi = self.scaled(self.uniform(p['isi_range_s']))
+            smp_ready_off = lsl.prepare(msg_ready_off)
+            planned_analysis = self.scaled(p['analysis_s'])
             msg_off = 'STIM_OFF %d %d %s' % (b, t, name)
-            msg_cross_on = 'CROSS_ON %d isi' % b
+            msg_analysis_on = 'ANALYSIS_ON %d %d' % (b, t)
             smp_off = lsl.prepare(msg_off)
-            smp_cross_on = lsl.prepare(msg_cross_on)
+            smp_analysis_on = lsl.prepare(msg_analysis_on)
             stim.draw()
 
             self.win.flip()                       # <- physical onset
@@ -907,12 +1006,13 @@ class PLRTask(object):
             lsl.push_at(smp_on, ts_on)            # <- the critical marker
 
             # --- non-critical bookkeeping, all stamped with ts_on ---
+            self._pending_off = None              # READY_OFF is sent right here
             t_on = self.session_clock.getTime()
-            lsl.push_at(smp_cross_off, ts_on)
-            el.send(msg_cross_off)
+            lsl.push_at(smp_ready_off, ts_on)
+            el.send(msg_ready_off)
             el.send(msg_on)
-            log.edf_message(msg_cross_off, ts_on)
-            log.write('cross_off', block=b, stimulus=phase_before, actual=actual,
+            log.edf_message(msg_ready_off, ts_on)
+            log.write('ready_off', block=b, trial=t, actual=self.last_actual,
                       t=t_on)
             log.edf_message(msg_on, ts_on)
             log.write('stim_on', block=b, trial=t, stimulus=name,
@@ -923,30 +1023,35 @@ class PLRTask(object):
                 stim.draw()
                 self.win.flip()
 
-            # ---------- STIMULUS OFFSET (cross back on) ----------
+            # ---------- STIMULUS OFFSET -> ANALYSIS: cross ----------
             self.cross.draw()
             self.win.flip()                       # <- physical offset
             ts_off = lsl.now()
             lsl.push_at(smp_off, ts_off)          # <- the critical marker
 
             t_off = self.session_clock.getTime()
-            lsl.push_at(smp_cross_on, ts_off)
+            lsl.push_at(smp_analysis_on, ts_off)
             el.send(msg_off)
-            el.send(msg_cross_on)
+            el.send(msg_analysis_on)
             log.edf_message(msg_off, ts_off)
             log.write('stim_off', block=b, trial=t, stimulus=name,
                       size_frac=size_frac, actual=t_off - t_on, t=t_off)
-            log.edf_message(msg_cross_on, ts_off)
-            log.write('cross_on', block=b, trial=t, stimulus='isi',
-                      planned=planned_isi, t=t_off)
+            log.edf_message(msg_analysis_on, ts_off)
+            log.write('analysis_on', block=b, trial=t, planned=planned_analysis,
+                      t=t_off)
+            self.arm_off('ANALYSIS_OFF %d %d' % (b, t), 'analysis_off',
+                         block=b, trial=t)
+            self.hold(planned_analysis, self.cross)  # cross stays up for the whole phase
 
-            actual = self.hold(planned_isi, self.cross)
+            # ---------- ISI: black screen, no cross ----------
+            planned_isi = self.scaled(self.uniform(p['isi_range_s']))
+            self.show((), 'ISI_ON %d %d' % (b, t), 'isi_on',
+                      actual=self.last_actual, block=b, trial=t,
+                      planned=planned_isi)
+            self.arm_off('ISI_OFF %d %d' % (b, t), 'isi_off', block=b, trial=t)
+            self.hold(planned_isi)                # black: nothing to draw
 
-        # ---- block end: cross off (next pause or end screen follows) ---
-        self.flip()
-        ts = self.mark('CROSS_OFF %d isi' % b, 'cross_off', block=b,
-                       trial=len(p['stimuli']), stimulus='isi', actual=actual)
-        self.mark('BLOCK_END %d' % b, 'block_end', ts=ts, block=b)
+        self.mark('BLOCK_END %d' % b, 'block_end', block=b)
 
     def shutdown(self):
         try:
