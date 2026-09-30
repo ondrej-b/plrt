@@ -12,3 +12,9 @@ mon.setWidth(53.0)            # visible screen width, cm
 mon.setDistance(60.0)         # eye to screen, cm
 mon.setSizePix([1920, 1080])
 mon.save()
+
+mon = monitors.Monitor('taVNS_lab_ext')
+mon.setWidth(53.0)            # visible screen width, cm
+mon.setDistance(60.0)         # eye to screen, cm
+mon.setSizePix([1920, 1080])
+mon.save()

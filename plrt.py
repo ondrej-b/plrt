@@ -110,13 +110,20 @@ PARAMS = dict(
     cross_color=(0.0, 0.0, 0.0),   # mid grey in PsychoPy's -1..1 scale
     cross_size_frac=0.03,          # arm length as fraction of screen height
     cross_line_px=3,
-    screen=0,                      # monitor index for the stimulus window
     fullscreen=True,
-    # Shared lab monitor definition, registered once per machine by
-    # setup_monitor.py (see the tavns-cpt repository); the SART task uses the
-    # same one.  Missing here is a warning, not an error: stimulus sizes are
-    # in 'height' units and do not depend on it.
-    monitor_name='taVNS_lab',
+    # Where to put the stimulus window, in order of preference:
+    #   (monitor calibration name, screen index)
+    # The first entry whose screen actually exists AND whose calibration is
+    # defined on this machine wins.  Screen 0 is the primary display as Windows
+    # reports it; the startup log lists the screens it found with their sizes.
+    # Calibrations are registered once per machine by setup_monitor.py (see the
+    # tavns-cpt repository; the SART task reads the same records).  None of this
+    # affects stimulus size - those are fractions of the window height - it only
+    # decides which display is used and what geometry is recorded with the data.
+    monitor_priority=[
+        ('taVNS_lab_ext', 1),      # external display in the testing booth
+        ('taVNS_lab', 0),          # laptop panel / single-display machine
+    ],
     expected_hz=60.0,              # used if measurement is off or unreliable
     measure_refresh=True,          # False -> trust expected_hz, skip the ~2 s test
     # --- EyeLink ------------------------------------------------------
@@ -152,7 +159,8 @@ PARAMS = dict(
 # Cedrus button.  '{minutes}' is filled in from the durations in PARAMS.
 # --------------------------------------------------------------------------
 INSTRUCTION_PAGES = [
-    'Měření pupilární reakce na světlo\n\n'
+    '=== PLRT ===\n\n'
+    'Vítejte v experimentu měření pupilární reakce na světlo\n\n'
     'Během měření budeme snímat velikost vaší zornice.\n'
     'Vaším úkolem je pouze sedět v klidu a dívat se na obrazovku;\n'
     'nic nemusíte mačkat ani nijak odpovídat.\n\n'
@@ -626,17 +634,17 @@ class PLRTask(object):
             step.last = now
         step.last = t_start
 
-        # --- monitor ----------------------------------------------------
-        self.mon, self.monitor_desc = self.load_monitor(params['monitor_name'])
+        # --- monitor and display ----------------------------------------
+        self.mon, self.monitor_desc, self.screen_index = self.choose_monitor()
         if self.mon is not None:
-            info['monitor_name'] = params['monitor_name']
+            info['monitor_name'] = self.mon.name
             info['monitor_desc'] = self.monitor_desc
         step('monitor resolved')
 
         # --- window ----------------------------------------------------
         self.win = visual.Window(
             monitor=self.mon,
-            fullscr=params['fullscreen'], screen=params['screen'],
+            fullscr=params['fullscreen'], screen=self.screen_index,
             color=params['bg_color'], colorSpace='rgb', units='height',
             allowGUI=False, waitBlanking=True)
         self.win.mouseVisible = False
@@ -645,7 +653,10 @@ class PLRTask(object):
         # nameless monitor, which can come from elsewhere in the same run, so
         # this line (and the CSV row below) is the authoritative record.
         self.window_monitor_desc = self.describe_window_monitor()
-        print('Window monitor: %s' % self.window_monitor_desc)
+        print('Window monitor: %s on screen %d, window %sx%s px'
+              % (self.window_monitor_desc, self.screen_index,
+                 self.win.size[0], self.win.size[1]))
+        self.check_resolution()
         step('window opened')
 
         # --- refresh rate & frame counts -------------------------------
@@ -719,8 +730,71 @@ class PLRTask(object):
                                            size[0] if size else '?',
                                            size[1] if size else '?')
 
+    def check_resolution(self):
+        """Warn if the calibration was measured at a different resolution.
+
+        This is the check that catches a calibration belonging to the other
+        display of a laptop-plus-external setup: the geometry would then be
+        wrong even though a monitor was found."""
+        if self.mon is None:
+            return
+        try:
+            calib = self.mon.getSizePix()
+            actual = [int(v) for v in self.win.size]
+        except Exception:
+            return
+        if not calib or list(calib) == actual:
+            return
+        print("WARNING: monitor '%s' byl kalibrován na %sx%s px, ale okno je "
+              "%sx%s px. Zkontrolujte, že kalibrace patří tomuto displeji "
+              "(šířka v cm a vzdálenost by pak byly špatné)."
+              % (self.mon.name, calib[0], calib[1], actual[0], actual[1]))
+
     @staticmethod
-    def load_monitor(name):
+    def list_screens():
+        """[(index, (w, h) or None), ...] for the displays a window can open on."""
+        try:
+            import pyglet
+            screens = pyglet.canvas.get_display().get_screens()
+            return [(i, (sc.width, sc.height)) for i, sc in enumerate(screens)]
+        except Exception as err:
+            print('WARNING: nelze vyjmenovat displeje (%s); predpokladam jeden.'
+                  % err)
+            return [(0, None)]
+
+    def choose_monitor(self):
+        """Pick the first usable (calibration, screen) pair from monitor_priority.
+
+        Returns (Monitor or None, description, screen index).  Note that a
+        PsychoPy 'Monitor' is only a named record of screen geometry - it does
+        not select a display.  The display is the `screen` index below."""
+        screens = self.list_screens()
+        print('Displeje: %s' % ', '.join(
+            'screen %d = %s' % (i, ('%dx%d' % wh) if wh else '?')
+            for i, wh in screens))
+        n_screens = len(screens)
+        for name, screen_idx in self.p['monitor_priority']:
+            if screen_idx >= n_screens:
+                print("Monitor '%s': screen %d není k dispozici -> zkouším dál."
+                      % (name, screen_idx))
+                continue
+            mon, desc = self.load_monitor(name, quiet=True)
+            if mon is None:
+                print("Monitor '%s': kalibrace není na tomto počítači -> "
+                      "zkouším dál." % name)
+                continue
+            print('Použiji monitor %s na screen %d.' % (desc, screen_idx))
+            return mon, desc, screen_idx
+        # Nothing matched: say where we looked, then fall back to the primary
+        # display with PsychoPy's defaults.
+        print('WARNING: žádný z nakonfigurovaných monitorů není použitelný -> '
+              'PsychoPy použije výchozí hodnoty a screen 0; do dat se nezapíše '
+              'geometrie obrazovky.')
+        self.load_monitor(self.p['monitor_priority'][0][0])   # prints details
+        return None, 'undefined', 0
+
+    @staticmethod
+    def load_monitor(name, quiet=False):
         """Fetch the shared lab monitor definition.
 
         Returns (Monitor or None, description string).  A missing or incomplete
@@ -746,12 +820,12 @@ class PLRTask(object):
                     folder = os.path.join(prefs.paths['userPrefsDir'], 'monitors')
                 except Exception:
                     folder = '<neznámá složka>'
-            print("WARNING: monitor '%s' není na tomto počítači nadefinovaný -> "
-                  "PsychoPy použije výchozí hodnoty a do dat se nezapíše "
-                  "geometrie obrazovky. %s" % (name, advice))
-            print("         hledáno v: %s" % folder)
-            print("         nalezené monitory: %s"
-                  % (', '.join(known) if known else '(žádné)'))
+            if not quiet:
+                print("WARNING: monitor '%s' není na tomto počítači "
+                      "nadefinovaný. %s" % (name, advice))
+                print("         hledáno v: %s" % folder)
+                print("         nalezené monitory: %s"
+                      % (', '.join(known) if known else '(žádné)'))
             return None, 'undefined'
         mon = monitors.Monitor(name)
         width, dist, size = mon.getWidth(), mon.getDistance(), mon.getSizePix()
