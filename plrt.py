@@ -25,7 +25,10 @@ Design (all durations configurable in PARAMS below)
 ---------------------------------------------------
 Session:
     dialog -> open LSL outlet (-> optional tracker connection)
-    -> wait for a recorder to subscribe -> instructions
+    -> wait for a recorder to subscribe
+    -> check the EyeLink stream is live (check_eyelink_stream.py; full report
+       to the console, verdict on screen, always skippable)
+    -> instructions (3 screens)
     -> DARK ADAPTATION, black screen, 90 s
     -> 4 blocks, running straight on from one another
     -> close.
@@ -152,6 +155,17 @@ PARAMS = dict(
     lsl_type='Markers',
     lsl_wait_for_consumer=True,    # hold the start until a recorder subscribes
     lsl_wait_skip_key='s',         # ... or until this key is pressed
+    # --- EyeLink stream check (check_eyelink_stream.py, same folder) ------
+    # Second startup screen: subscribe to the stream the Ubuntu machine
+    # republishes and verify it carries LIVE eye data.  The full report goes to
+    # the console; the screen shows only the verdict.  It can always be skipped.
+    check_eye_stream=True,
+    eye_stream_name='EyeLink',
+    eye_stream_type='Gaze',
+    eye_stream_seconds=3.0,        # how much data the check collects
+    eye_stream_timeout=5.0,        # how long to look for the stream
+    eye_stream_eyes='any',         # any | left | right | both
+    eye_stream_repeat_key='r',     # re-run the check from the result screen
 )
 
 # --------------------------------------------------------------------------
@@ -178,6 +192,13 @@ INSTRUCTION_PAGES = [
     'Celé měření trvá přibližně {minutes} minut.\n\n'
     'Stisknutím tlačítka měření začne.',
 ]
+
+class _CheckArgs(object):
+    """What check_eyelink_stream.run_once() reads off its argparse namespace."""
+
+    def __init__(self, **kw):
+        self.__dict__.update(kw)
+
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(SCRIPT_DIR, 'data')
@@ -624,6 +645,7 @@ class PLRTask(object):
         self.rng = random.Random(info['seed'])
         self.session_clock = core.Clock()
         self._pending_off = None       # OFF marker owed by the screen on display
+        self.eye_check_verdict = 'not run'   # filled in by check_eye_stream()
         self.last_actual = None        # measured duration of the phase just ended
         t_start = core.getTime()
 
@@ -881,16 +903,23 @@ class PLRTask(object):
         self.last_actual = self.session_clock.getTime() - t0
         return self.last_actual
 
-    def wait_confirm(self, *stims):
+    def wait_confirm(self, *stims, **kwargs):
         """Show `stims` until a confirm key (space) or ANY Cedrus button is
-        pressed.  Esc aborts.  Returns 'key:<name>' or 'cedrus:<n>'."""
+        pressed.  Esc aborts.  Returns 'key:<name>' or 'cedrus:<n>'.
+
+        extra_keys: further keys that also end the wait (returned the same way),
+        for screens that offer more than "continue"."""
+        extra = list(kwargs.pop('extra_keys', ()))
+        if kwargs:
+            raise TypeError('unexpected kwargs: %s' % list(kwargs))
         event.clearEvents()
         self.box.clear()
         while True:
             for s in stims:
                 s.draw()
             self.win.flip()
-            keys = event.getKeys(keyList=self.p['confirm_keys'] + [self.p['abort_key']])
+            keys = event.getKeys(keyList=self.p['confirm_keys'] + extra
+                                 + [self.p['abort_key']])
             if self.p['abort_key'] in keys:
                 raise AbortExperiment()
             if keys:
@@ -954,6 +983,106 @@ class PLRTask(object):
             self.log.write('instructions_page', trial=i, stimulus=how)
         self.flip()
 
+    # ------------------------------------------------------------------
+    # EyeLink stream check (startup screen 2)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def load_stream_checker():
+        """Import check_eyelink_stream.py from next to this script.
+
+        The module exits the interpreter when pylsl is missing, so SystemExit
+        has to be caught here - otherwise a missing dependency in the checker
+        would take the whole task down."""
+        path = os.path.join(SCRIPT_DIR, 'check_eyelink_stream.py')
+        if not os.path.isfile(path):
+            print('WARNING: check_eyelink_stream.py není ve složce se skriptem '
+                  '(%s) -> kontrola streamu se přeskočí.' % SCRIPT_DIR)
+            return None
+        try:
+            import importlib.util
+            spec = importlib.util.spec_from_file_location(
+                'check_eyelink_stream', path)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            return mod
+        except SystemExit as err:            # the module's own pylsl guard
+            print('WARNING: check_eyelink_stream.py nelze spustit: %s' % err)
+            return None
+        except Exception as err:
+            print('WARNING: check_eyelink_stream.py nelze importovat: %r' % err)
+            return None
+
+    def check_eye_stream(self):
+        """Run the stream check and show only its verdict on screen.
+
+        The complete report is printed to the console by run_once().  Any
+        confirm key or Cedrus button continues (even on FAIL), the repeat key
+        runs the check again, Esc aborts."""
+        p = self.p
+        self.eye_check_verdict = 'skipped'
+        if not p['check_eye_stream']:
+            return
+        mod = self.load_stream_checker()
+        if mod is None:
+            self.eye_check_verdict = 'unavailable'
+            self.text.text = ('Kontrolu EyeLink streamu nelze spustit.\n'
+                              '(podrobnosti ve výstupu v konzoli)\n\n'
+                              'Pokračujte stisknutím tlačítka.')
+            how = self.wait_confirm(self.text)
+            self.log.write('eye_stream_check', stimulus='unavailable')
+            self.log.write('eye_stream_continue', stimulus=how)
+            self.flip()
+            return
+
+        args = _CheckArgs(name=p['eye_stream_name'], type=p['eye_stream_type'],
+                          seconds=p['eye_stream_seconds'],
+                          timeout=p['eye_stream_timeout'],
+                          eyes=p['eye_stream_eyes'])
+        repeat_key = p['eye_stream_repeat_key']
+        while True:
+            self.text.text = ('Kontroluji EyeLink stream...\n\n'
+                              'Podrobný výstup se vypisuje do konzole.')
+            self.flip(self.text)
+            print('\n' + '-' * 78)
+            print('EyeLink stream check (plrt.py startup)')
+            print('-' * 78)
+            try:
+                verdict, _info, eyes = mod.run_once(args)
+            except Exception as err:
+                print('Kontrola selhala s výjimkou: %r' % err)
+                verdict, eyes = 'ERROR', None
+            self.eye_check_verdict = str(verdict)
+            self.log.write('eye_stream_check', stimulus=self.eye_check_verdict)
+            self.text.text = self.eye_check_text(verdict, eyes, repeat_key)
+            how = self.wait_confirm(self.text, extra_keys=[repeat_key])
+            if how == 'key:%s' % repeat_key:
+                self.log.write('eye_stream_recheck', stimulus=how)
+                continue
+            self.log.write('eye_stream_continue', stimulus=how)
+            break
+        self.flip()
+
+    def eye_check_text(self, verdict, eyes, repeat_key):
+        """One-line verdict for the screen; the detail stays in the console."""
+        headline = {
+            'OK': 'Kontrola EyeLink streamu: OK\n\n'
+                  'Data z očí jsou živá, měření může začít.',
+            'WARN': 'Kontrola EyeLink streamu: VAROVÁNÍ\n\n'
+                    'Data jsou živá, ale něco není ideální -\n'
+                    'přečtěte si řádky [WARN] v konzoli.',
+            'FAIL': 'Kontrola EyeLink streamu: CHYBA\n\n'
+                    'Data z očí nejsou živá. Záznam by byl nepoužitelný -\n'
+                    'přečtěte si řádky [FAIL] v konzoli.',
+        }.get(str(verdict),
+              'Kontrola EyeLink streamu se nepodařila provést.\n\n'
+              'Podrobnosti jsou ve výstupu v konzoli.')
+        if eyes:
+            headline += '\n\nSledované oko: %s' % ' + '.join(eyes)
+        return (headline + '\n\n'
+                'tlačítko = pokračovat i tak\n'
+                '%s = zopakovat kontrolu\n'
+                'Esc = ukončit' % repeat_key)
+
     def wait_for_recorder(self):
         """Hold the session until something subscribes to the LSL outlet.
 
@@ -1006,6 +1135,7 @@ class PLRTask(object):
         self.win.mouseVisible = False
         self.flip()
         self.wait_for_recorder()
+        self.check_eye_stream()
         self.instructions()
 
         el.start_recording()
@@ -1016,6 +1146,7 @@ class PLRTask(object):
         log.write('info_refresh_hz', actual=self.hz)
         log.write('info_monitor', stimulus=self.monitor_desc)
         log.write('info_window_monitor', stimulus=self.window_monitor_desc)
+        log.write('info_eye_stream_check', stimulus=self.eye_check_verdict)
         log.write('info_seed', stimulus=str(self.info['seed']))
 
         try:
